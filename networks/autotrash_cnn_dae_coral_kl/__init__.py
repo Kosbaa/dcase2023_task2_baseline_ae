@@ -1,0 +1,1 @@
+from networks.autotrash_cnn_dae_coral_kl.autotrash_cnn_dae_coral_kl import AutoTrashCnnDaeCoralKl
