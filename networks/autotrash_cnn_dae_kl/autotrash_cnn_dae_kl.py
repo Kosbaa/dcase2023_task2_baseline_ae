@@ -2,7 +2,6 @@ import csv
 import datetime
 import glob
 import os
-import pickle
 import shutil
 import sys
 import time
@@ -18,11 +17,11 @@ from sklearn import metrics
 
 from datasets import loader_common as loader_com
 from networks.base_model import BaseModel
-from networks.autotrash_cnn_dae_coral_kl.network import AutoTrashUNetDenoisingAE
+from networks.autotrash_cnn_dae_kl.network import AutoTrashUNetDenoisingAE
 from tools.plot_loss_curve import csv_to_figdata
 
 
-MODEL_NAME = "autotrash_cnn_dae_coral_kl"
+MODEL_NAME = "autotrash_cnn_dae_kl"
 
 
 def save_csv(save_file_path, save_data):
@@ -100,13 +99,13 @@ class SupplementalFeatureDataset(Dataset):
         return self.data[index], 0.0, self.condition, self.basenames[index], index
 
 
-class AutoTrashCnnDaeCoralKl(BaseModel):
+class AutoTrashCnnDaeKl(BaseModel):
     """
     AutoTrash-specific reconstruction model.
 
     It keeps the official output workflow based on anomaly-score CSVs, but trains
-    with denoising augmentation, domain-balanced reconstruction, CORAL latent
-    alignment, and weak annealed KL regularization.
+    with denoising augmentation, domain-balanced reconstruction, and weak
+    annealed KL regularization.
     """
 
     def __init__(self, args, train, test):
@@ -161,13 +160,13 @@ class AutoTrashCnnDaeCoralKl(BaseModel):
             ["val_loss"],
             ["recon_loss", "source_recon_loss", "target_recon_loss"],
             ["recon_gap"],
-            ["coral_loss", "kl_loss"],
-            ["lambda_coral", "lambda_kl"],
+            ["kl_loss"],
+            ["lambda_kl"],
             ["epoch_seconds", "avg_batch_seconds"],
         ]
         return (
             "loss,val_loss,recon_loss,source_recon_loss,target_recon_loss,"
-            "recon_gap,coral_loss,kl_loss,lambda_coral,lambda_kl,"
+            "recon_gap,kl_loss,lambda_kl,"
             "epoch_seconds,avg_batch_seconds"
         )
 
@@ -298,7 +297,7 @@ class AutoTrashCnnDaeCoralKl(BaseModel):
             target = target | supplemental
         return source, target
 
-    def _augment(self, x):
+    def _augment(self, x, basenames=None):
         """
         Denoising corruption applied only during training.
 
@@ -307,7 +306,13 @@ class AutoTrashCnnDaeCoralKl(BaseModel):
         Gain is implemented as a log-domain dB shift, matching log-mel features.
         """
         img = self._to_image(x).clone()
+        original_img = img.clone()
         b, _, mel_bins, frames = img.shape
+        is_target = torch.zeros(b, dtype=torch.bool, device=img.device)
+        if basenames is not None:
+            for i, name in enumerate(basenames):
+                if "target" in name and "supplemental" not in name:
+                    is_target[i] = True
 
         if self.args.autotrash_aug_gain_min != 1.0 or self.args.autotrash_aug_gain_max != 1.0:
             gain = torch.empty(b, 1, 1, 1, device=img.device).uniform_(
@@ -369,6 +374,9 @@ class AutoTrashCnnDaeCoralKl(BaseModel):
                 scale = x_rms / (n_rms.clamp_min(1e-6) * torch.pow(10.0, snr / 20.0))
                 img = img + noise * scale
 
+        if is_target.any():
+            img[is_target] = original_img[is_target]
+
         return self._to_vector(img)
 
     def _sample_scores(self, recon_x, x):
@@ -378,7 +386,9 @@ class AutoTrashCnnDaeCoralKl(BaseModel):
         source_loss = sample_scores[source_mask].mean() if source_mask.any() else None
         target_loss = sample_scores[target_mask].mean() if target_mask.any() else None
 
-        if source_loss is not None and target_loss is not None:
+        if not self.args.autotrash_use_balanced_recon:
+            recon_loss = sample_scores.mean()
+        elif source_loss is not None and target_loss is not None:
             recon_loss = 0.5 * source_loss + 0.5 * target_loss
         elif source_loss is not None:
             recon_loss = source_loss
@@ -393,36 +403,21 @@ class AutoTrashCnnDaeCoralKl(BaseModel):
         gap = torch.abs(source_log - target_log) if source_loss is not None and target_loss is not None else zero
         return recon_loss, source_log, target_log, gap
 
-    def _coral_loss(self, z_source, z_target):
-        if z_source.shape[0] < 2 or z_target.shape[0] < 2:
-            return z_source.new_tensor(0.0)
-        z_source = z_source - z_source.mean(dim=0, keepdim=True)
-        z_target = z_target - z_target.mean(dim=0, keepdim=True)
-        cov_source = z_source.t().mm(z_source) / (z_source.shape[0] - 1)
-        cov_target = z_target.t().mm(z_target) / (z_target.shape[0] - 1)
-        d = z_source.shape[1]
-        return torch.sum((cov_source - cov_target) ** 2) / (4.0 * d * d)
-
     def _kl_loss(self, mu, logvar):
         return -0.5 * torch.mean(1.0 + logvar - mu.pow(2) - logvar.exp())
 
-    def _lambda_coral(self, epoch):
-        if epoch < self.args.autotrash_coral_start_epoch:
-            return 0.0
-        return self.args.autotrash_lambda_coral
-
     def _lambda_kl(self, epoch):
+        if not self.args.autotrash_use_kl:
+            return 0.0
         if epoch < self.args.autotrash_kl_start_epoch:
             return 0.0
         anneal_epochs = max(1, self.args.epochs - self.args.autotrash_kl_start_epoch)
         progress = (epoch - self.args.autotrash_kl_start_epoch) / anneal_epochs
         return self.args.autotrash_kl_max_weight * min(1.0, max(0.0, progress))
 
-    def _warn_if_needed(self, recon_loss, source_loss, target_loss, coral_loss, kl_loss, lambda_coral, lambda_kl):
+    def _warn_if_needed(self, recon_loss, source_loss, target_loss, kl_loss, lambda_kl):
         if source_loss > 0 and target_loss > 0 and source_loss < target_loss * self.args.autotrash_source_bias_warn_ratio:
             print("warning: source reconstruction loss is much lower than target loss; model may remain source-biased")
-        if recon_loss > 0 and lambda_coral * coral_loss > self.args.autotrash_coral_domination_ratio * recon_loss:
-            print("warning: weighted CORAL loss is large versus reconstruction; consider reducing autotrash_lambda_coral")
         if recon_loss > 0 and lambda_kl * kl_loss > self.args.autotrash_kl_blur_ratio * recon_loss:
             print("warning: weighted KL is large versus reconstruction; latent smoothing may blur reconstructions")
         if self.prev_recon_loss is not None and recon_loss < self.prev_recon_loss * self.args.autotrash_recon_collapse_ratio:
@@ -441,7 +436,7 @@ class AutoTrashCnnDaeCoralKl(BaseModel):
         return (
             f"Epoch [{epoch}/{self.args.epochs}] Batch [{batch_idx}/{n_batches}] | "
             f"Loss: {losses['loss']:.4f} | Recon: {losses['recon']:.4f} | "
-            f"CORAL: {losses['coral']:.4f} | KL: {losses['kl']:.4f} | "
+            f"KL: {losses['kl']:.4f} | "
             f"Elapsed: {_format_seconds(elapsed)} | ETA: {_format_seconds(remaining)} | "
             f"Finish: {finish.strftime('%H:%M:%S')}"
         )
@@ -463,10 +458,8 @@ class AutoTrashCnnDaeCoralKl(BaseModel):
             "source": 0.0,
             "target": 0.0,
             "gap": 0.0,
-            "coral": 0.0,
             "kl": 0.0,
         }
-        lambda_coral = self._lambda_coral(epoch)
         lambda_kl = self._lambda_kl(epoch)
         n_batches = len(self.train_loader)
 
@@ -478,23 +471,19 @@ class AutoTrashCnnDaeCoralKl(BaseModel):
             source_mask, target_mask = self._domain_masks(basenames, data.device)
 
             self.optimizer.zero_grad()
-            aug_data = self._augment(data)
-            recon_batch, z, mu, logvar = self.model(aug_data)
-            sample_scores = self._sample_scores(recon_batch, data)
+            model_input = self._augment(data, basenames) if self.args.autotrash_use_augmentation else data
+            # Denoising ON reconstructs the original clean patch from corrupted input.
+            # Denoising OFF keeps augmentation active but trains a standard AE target.
+            recon_target = data if self.args.autotrash_use_denoising else model_input.detach()
+            recon_batch, _, mu, logvar = self.model(model_input)
+            sample_scores = self._sample_scores(recon_batch, recon_target)
             recon_loss, source_loss, target_loss, gap = self._domain_balanced_recon_loss(
                 sample_scores,
                 source_mask,
                 target_mask,
             )
-            global_step = (epoch - 1) * n_batches + batch_idx
-            should_compute_coral = (
-                lambda_coral > 0
-                and self.args.autotrash_coral_interval > 0
-                and global_step % self.args.autotrash_coral_interval == 0
-            )
-            coral_loss = self._coral_loss(z[source_mask], z[target_mask]) if should_compute_coral else data.new_tensor(0.0)
             kl_loss = self._kl_loss(mu, logvar)
-            self.loss = recon_loss + lambda_coral * coral_loss + lambda_kl * kl_loss
+            self.loss = recon_loss + lambda_kl * kl_loss
             self.loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.autotrash_grad_clip)
             self.optimizer.step()
@@ -504,7 +493,6 @@ class AutoTrashCnnDaeCoralKl(BaseModel):
             sums["source"] += float(source_loss.detach())
             sums["target"] += float(target_loss.detach())
             sums["gap"] += float(gap.detach())
-            sums["coral"] += float(coral_loss.detach())
             sums["kl"] += float(kl_loss.detach())
 
             if self.args.autotrash_show_progress and (
@@ -521,7 +509,6 @@ class AutoTrashCnnDaeCoralKl(BaseModel):
                     losses={
                         "loss": sums["loss"] / batch_idx,
                         "recon": sums["recon"] / batch_idx,
-                        "coral": sums["coral"] / batch_idx,
                         "kl": sums["kl"] / batch_idx,
                     },
                 ))
@@ -545,23 +532,19 @@ class AutoTrashCnnDaeCoralKl(BaseModel):
             recon_loss=means["recon"],
             source_loss=means["source"],
             target_loss=means["target"],
-            coral_loss=means["coral"],
             kl_loss=means["kl"],
-            lambda_coral=lambda_coral,
             lambda_kl=lambda_kl,
         )
 
         with open(self.log_path, "a") as log:
-            np.savetxt(log, ["{0},{1},{2},{3},{4},{5},{6},{7},{8},{9},{10},{11}".format(
+            np.savetxt(log, ["{0},{1},{2},{3},{4},{5},{6},{7},{8},{9}".format(
                 means["loss"],
                 val_loss,
                 means["recon"],
                 means["source"],
                 means["target"],
                 means["gap"],
-                means["coral"],
                 means["kl"],
-                lambda_coral,
                 lambda_kl,
                 epoch_seconds,
                 avg_batch_seconds,
@@ -574,15 +557,6 @@ class AutoTrashCnnDaeCoralKl(BaseModel):
             fig_count=len(self.column_heading_list),
             cut_first_epoch=True,
         )
-        if self.args.autotrash_clean_threshold_calibration:
-            calibration_scores = self._clean_calibration_scores()
-            print(
-                "clean threshold calibration -> "
-                f"{len(calibration_scores)} file-level scores, "
-                f"mean={np.mean(calibration_scores):.6f}, "
-                f"max={np.max(calibration_scores):.6f}"
-            )
-            self.fit_anomaly_score_distribution(y_pred=calibration_scores)
         torch.save(self.model.state_dict(), self.model_path)
         torch.save({
             "epoch": epoch,
@@ -590,6 +564,8 @@ class AutoTrashCnnDaeCoralKl(BaseModel):
             "optimizer_state_dict": self.optimizer.state_dict(),
             "loss": self.loss,
         }, self.checkpoint_path)
+        if epoch == self.args.epochs and self.args.autotrash_clean_threshold_calibration:
+            self._run_final_threshold_calibration()
 
     def _validate(self):
         val_loss = 0.0
@@ -603,40 +579,56 @@ class AutoTrashCnnDaeCoralKl(BaseModel):
                 val_loss += float(loss)
         return val_loss / max(1, len(self.valid_loader))
 
-    def _collect_clean_file_scores(self, loader):
+    def _run_final_threshold_calibration(self):
         """
-        Collect clean inference-style reconstruction scores.
+        Calibrate the decision threshold once after training completes.
+        Uses only held-out validation clips from the source domain.
 
-        Training still uses corrupted input, but decision thresholds must match
-        test-time scoring. We therefore run the model on clean patches and group
-        patch errors by basename, producing one score per source/target normal
-        training file, matching the clip-level mean score used during evaluation.
+        Source-only rationale:
+        - 990 source normals give a stable score distribution
+        - Target scores are systematically offset from source scores
+        - Mixing them biases the threshold upward, causing target recall collapse
         """
-        score_sum = {}
-        score_count = {}
+        scores = []
         with torch.no_grad():
             self.model.eval()
-            for batch in loader:
+            for batch in self.valid_loader:
                 data = batch[0].to(self.device).float()
                 basenames = batch[3]
                 recon_batch, _, _, _ = self.model(data)
-                sample_scores = self._sample_scores(recon_batch, data).detach().cpu().numpy()
-                for basename, score in zip(basenames, sample_scores):
-                    score_sum[basename] = score_sum.get(basename, 0.0) + float(score)
-                    score_count[basename] = score_count.get(basename, 0) + 1
-        return [score_sum[name] / score_count[name] for name in sorted(score_sum)]
+                patch_errors = self._sample_scores(recon_batch, data).detach().cpu().numpy()
+                for basename, score in zip(basenames, patch_errors):
+                    if "target" in basename:
+                        continue
+                    scores.append(float(score))
 
-    def _clean_calibration_scores(self):
-        loaders = [self.valid_loader]
-        if self.args.autotrash_threshold_calibration_set == "train_valid":
-            loaders = [self.train_loader, self.valid_loader]
-
-        scores = []
-        for loader in loaders:
-            scores.extend(self._collect_clean_file_scores(loader))
         if len(scores) == 0:
-            raise RuntimeError("clean threshold calibration produced no scores")
-        return scores
+            print("warning: no source clips found in valid_loader; falling back to all validation clips")
+            with torch.no_grad():
+                self.model.eval()
+                for batch in self.valid_loader:
+                    data = batch[0].to(self.device).float()
+                    recon_batch, _, _, _ = self.model(data)
+                    patch_errors = self._sample_scores(recon_batch, data).detach().cpu().numpy()
+                    scores.extend([float(s) for s in patch_errors])
+
+        scores_array = np.array(scores)
+        print(
+            f"threshold calibration -> {len(scores)} source patches | "
+            f"mean={np.mean(scores_array):.6f} | std={np.std(scores_array):.6f} | "
+            f"min={np.min(scores_array):.6f} | max={np.max(scores_array):.6f}"
+        )
+        self.fit_anomaly_score_distribution(y_pred=scores_array)
+
+        fitted_threshold = self.calc_decision_threshold()
+        p99 = float(np.percentile(scores_array, 99))
+        print(f"fitted threshold -> {fitted_threshold:.6f} | p99 of calibration scores -> {p99:.6f}")
+        if fitted_threshold > p99 * 2.0:
+            print(
+                f"WARNING: fitted threshold ({fitted_threshold:.6f}) far exceeds 2x p99 "
+                f"({p99 * 2.0:.6f}). Gamma fit may have failed on this seed. "
+                f"Decision file results will be unreliable for this run."
+            )
 
     def load_state_dict(self, checkpoint):
         super().load_state_dict(checkpoint=checkpoint)
@@ -651,14 +643,7 @@ class AutoTrashCnnDaeCoralKl(BaseModel):
         self.model.load_state_dict(torch.load(self.model_path, map_location=self.device))
         self.model.eval()
         if self.args.autotrash_clean_threshold_calibration:
-            calibration_scores = self._clean_calibration_scores()
-            print(
-                "clean threshold calibration -> "
-                f"{len(calibration_scores)} file-level scores, "
-                f"mean={np.mean(calibration_scores):.6f}, "
-                f"max={np.max(calibration_scores):.6f}"
-            )
-            self.fit_anomaly_score_distribution(y_pred=calibration_scores)
+            self._run_final_threshold_calibration()
         decision_threshold = self.calc_decision_threshold()
         print(f"decision threshold -> {decision_threshold:.6f}")
 

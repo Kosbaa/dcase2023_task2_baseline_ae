@@ -82,8 +82,8 @@ def get_argparse():
                         help='shuffle type (full , simple)')
     parser.add_argument('--validation_split', type=float, default=0.1)
 
-    # AutoTrash-specific CNN DAE + CORAL + KL model settings.
-    # These options are consumed only by --model autotrash_cnn_dae_coral_kl.
+    # AutoTrash-specific CNN DAE + KL model settings.
+    # These options are consumed only by --model autotrash_cnn_dae_kl.
     parser.add_argument('--autotrash_epochs', type=int, default=30,
                         help='number of epochs for the AutoTrash CNN DAE variant')
     parser.add_argument('--autotrash_batch_size', type=int, default=512,
@@ -94,12 +94,14 @@ def get_argparse():
                         help='compact latent dimension for AutoTrash CNN DAE')
     parser.add_argument('--autotrash_skip_scale', type=float, default=0.5,
                         help='scale applied to narrowed U-Net skip connections')
-    parser.add_argument('--autotrash_lambda_coral', type=float, default=0.01,
-                        help='CORAL latent alignment weight after warm-up')
-    parser.add_argument('--autotrash_coral_start_epoch', type=int, default=6,
-                        help='first epoch where CORAL alignment is enabled')
-    parser.add_argument('--autotrash_coral_interval', type=int, default=5,
-                        help='compute CORAL once every N global batches')
+    parser.add_argument('--autotrash_use_denoising', type=str2bool, default=True,
+                        help='train against the clean patch target when augmentation corrupts the input')
+    parser.add_argument('--autotrash_use_augmentation', type=str2bool, default=True,
+                        help='enable AutoTrash training-time corruption and augmentation pipeline')
+    parser.add_argument('--autotrash_use_balanced_recon', type=str2bool, default=True,
+                        help='use equal source/target reconstruction weighting when both domains are present')
+    parser.add_argument('--autotrash_use_kl', type=str2bool, default=True,
+                        help='enable weak KL latent regularization for the AutoTrash CNN DAE variant')
     parser.add_argument('--autotrash_kl_start_epoch', type=int, default=6,
                         help='first epoch where weak KL annealing starts')
     parser.add_argument('--autotrash_kl_max_weight', type=float, default=0.001,
@@ -110,9 +112,6 @@ def get_argparse():
                         help='rebuild AutoTrash feature caches before training/testing')
     parser.add_argument('--autotrash_clean_threshold_calibration', type=str2bool, default=True,
                         help='fit decision threshold from clean inference-style calibration scores')
-    parser.add_argument('--autotrash_threshold_calibration_set', type=str, default='valid',
-                        choices=['valid', 'train_valid'],
-                        help='clean score set used for threshold calibration')
     parser.add_argument('--autotrash_aug_gaussian_std', type=float, default=0.03,
                         help='feature-space Gaussian noise strength for denoising training')
     parser.add_argument('--autotrash_aug_gain_min', type=float, default=0.8,
@@ -151,8 +150,6 @@ def get_argparse():
                         help='number of batches between ETA progress updates')
     parser.add_argument('--autotrash_source_bias_warn_ratio', type=float, default=0.7,
                         help='warn when source reconstruction loss is this fraction below target loss')
-    parser.add_argument('--autotrash_coral_domination_ratio', type=float, default=0.25,
-                        help='warn when weighted CORAL exceeds this fraction of reconstruction loss')
     parser.add_argument('--autotrash_kl_blur_ratio', type=float, default=0.1,
                         help='warn when weighted KL exceeds this fraction of reconstruction loss')
     parser.add_argument('--autotrash_recon_collapse_ratio', type=float, default=0.5,

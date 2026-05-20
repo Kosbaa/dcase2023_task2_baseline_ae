@@ -199,9 +199,9 @@ class DCASE202XT2Loader(torch.utils.data.Dataset):
             # required for calculating y_pred for each wave file
             n_files_ea_section = []
 
-            self.data = np.empty((0, frames * n_mels), float)
-            self.y_true = np.empty(0, float)
-            self.condition = np.empty((0, n_sections), float)
+            self.data = np.empty((0, frames * n_mels), dtype=np.float32)
+            self.y_true = np.empty(0, dtype=np.float32)
+            self.condition = np.empty((0, n_sections), dtype=np.float32)
             self.basenames = []
             for section_idx, section_name in enumerate(unique_section_names):
 
@@ -229,11 +229,12 @@ class DCASE202XT2Loader(torch.utils.data.Dataset):
                                         fmin=fmin,
                                         win_length=win_length,
                                         mono=mono)
+                data_ea_section = data_ea_section.astype(np.float32, copy=False)
                 self.data = np.append(self.data, data_ea_section, axis=0)
                 if self.mode or train:
-                    self.y_true = np.append(self.y_true, y_true, axis=0)
+                    self.y_true = np.append(self.y_true, np.asarray(y_true, dtype=np.float32), axis=0)
                 for i in range(len(data_ea_section) // len(files)):
-                    self.condition = np.append(self.condition, condition, axis=0)
+                    self.condition = np.append(self.condition, np.asarray(condition, dtype=np.float32), axis=0)
             
             if is_enabled_dataset_dir_lock:
                 com.release_read_lock(
@@ -286,6 +287,9 @@ class DCASE202XT2Loader(torch.utils.data.Dataset):
         try:
             with open(pickle_path, 'rb') as f:
                 self.data, self.y_true, self.condition, self.n_vectors_ea_file, self.basenames = pickle.load(f)
+            self.data = self.data.astype(np.float32, copy=False)
+            self.y_true = self.y_true.astype(np.float32, copy=False)
+            self.condition = self.condition.astype(np.float32, copy=False)
         except FileNotFoundError:
             print(f"{datetime.datetime.now()}\tFileNotFoundError: can not load pickle.")
             time.sleep(retry_delay_time)
