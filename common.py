@@ -100,7 +100,7 @@ def get_argparse():
                         help='enable AutoTrash training-time corruption and augmentation pipeline')
     parser.add_argument('--autotrash_use_balanced_recon', type=str2bool, default=True,
                         help='use equal source/target reconstruction weighting when both domains are present')
-    parser.add_argument('--autotrash_use_kl', type=str2bool, default=True,
+    parser.add_argument('--autotrash_use_kl', type=str2bool, default=False,
                         help='enable weak KL latent regularization for the AutoTrash CNN DAE variant')
     parser.add_argument('--autotrash_kl_start_epoch', type=int, default=6,
                         help='first epoch where weak KL annealing starts')
@@ -110,8 +110,6 @@ def get_argparse():
                         help='cache directory for AutoTrash extracted feature tensors')
     parser.add_argument('--autotrash_rebuild_cache', type=str2bool, default=False,
                         help='rebuild AutoTrash feature caches before training/testing')
-    parser.add_argument('--autotrash_clean_threshold_calibration', type=str2bool, default=True,
-                        help='fit decision threshold from clean inference-style calibration scores')
     parser.add_argument('--autotrash_aug_gaussian_std', type=float, default=0.03,
                         help='feature-space Gaussian noise strength for denoising training')
     parser.add_argument('--autotrash_aug_gain_min', type=float, default=0.8,
@@ -126,13 +124,13 @@ def get_argparse():
                         help='maximum SpecAugment frequency-mask width')
     parser.add_argument('--autotrash_aug_freq_mask_prob', type=float, default=0.5,
                         help='probability of applying a frequency mask')
-    parser.add_argument('--autotrash_use_supplemental_clean', type=str2bool, default=True,
+    parser.add_argument('--autotrash_use_supplemental_clean', type=str2bool, default=False,
                         help='append AutoTrash supplemental clean machine recordings as normal training patches')
     parser.add_argument('--autotrash_supplemental_clean_glob', type=str, default='*machine*.wav',
                         help='glob for supplemental clean machine wav files')
     parser.add_argument('--autotrash_supplemental_domain', type=str, default='target', choices=['source', 'target'],
                         help='domain bucket used for supplemental clean data in balanced loss')
-    parser.add_argument('--autotrash_use_supplemental_noise', type=str2bool, default=True,
+    parser.add_argument('--autotrash_use_supplemental_noise', type=str2bool, default=False,
                         help='enable optional supplemental noise-only mixing when matching files exist')
     parser.add_argument('--autotrash_supplemental_noise_glob', type=str, default='*noise*.wav',
                         help='glob for supplemental noise-only wav files')
@@ -148,14 +146,6 @@ def get_argparse():
                         help='show ETA training progress for AutoTrash CNN DAE')
     parser.add_argument('--autotrash_eta_update_interval', type=int, default=10,
                         help='number of batches between ETA progress updates')
-    parser.add_argument('--autotrash_source_bias_warn_ratio', type=float, default=0.7,
-                        help='warn when source reconstruction loss is this fraction below target loss')
-    parser.add_argument('--autotrash_kl_blur_ratio', type=float, default=0.1,
-                        help='warn when weighted KL exceeds this fraction of reconstruction loss')
-    parser.add_argument('--autotrash_recon_collapse_ratio', type=float, default=0.5,
-                        help='warn when epoch reconstruction loss drops by this ratio versus previous epoch')
-    parser.add_argument('--autotrash_source_auc_warn_floor', type=float, default=0.6,
-                        help='warn if local source AUC falls below this value while target AUC is higher')
 
     # dataset
     parser.add_argument('--dataset_directory', type=str, default='data',

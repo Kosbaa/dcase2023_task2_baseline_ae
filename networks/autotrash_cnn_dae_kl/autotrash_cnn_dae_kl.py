@@ -118,9 +118,6 @@ class AutoTrashCnnDaeKl(BaseModel):
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
         if self.optim_state_dict:
             self.optimizer.load_state_dict(self.optim_state_dict)
-        self.prev_recon_loss = None
-        self.prev_source_loss = None
-        self.prev_target_loss = None
         self._print_startup_status()
 
     def _prepare_autotrash_args(self, args):
@@ -218,6 +215,14 @@ class AutoTrashCnnDaeKl(BaseModel):
             allocated = torch.cuda.memory_allocated(device_idx) / (1024 ** 2)
             reserved = torch.cuda.memory_reserved(device_idx) / (1024 ** 2)
             print(f"gpu memory allocated/reserved: {allocated:.2f} MB / {reserved:.2f} MB")
+        print("--- component status ---")
+        print(f"denoising:          {self.args.autotrash_use_denoising}")
+        print(f"augmentation:       {self.args.autotrash_use_augmentation}")
+        print(f"balanced_recon:     {self.args.autotrash_use_balanced_recon}")
+        print(f"kl:                 {self.args.autotrash_use_kl}")
+        print(f"supplemental_clean: {self.args.autotrash_use_supplemental_clean}")
+        print(f"supplemental_noise: {self.args.autotrash_use_supplemental_noise}")
+        print(f"decision_threshold_quantile: {self.args.decision_threshold}")
 
     def _append_supplemental_clean_data(self):
         if not self.args.autotrash_use_supplemental_clean:
@@ -415,17 +420,6 @@ class AutoTrashCnnDaeKl(BaseModel):
         progress = (epoch - self.args.autotrash_kl_start_epoch) / anneal_epochs
         return self.args.autotrash_kl_max_weight * min(1.0, max(0.0, progress))
 
-    def _warn_if_needed(self, recon_loss, source_loss, target_loss, kl_loss, lambda_kl):
-        if source_loss > 0 and target_loss > 0 and source_loss < target_loss * self.args.autotrash_source_bias_warn_ratio:
-            print("warning: source reconstruction loss is much lower than target loss; model may remain source-biased")
-        if recon_loss > 0 and lambda_kl * kl_loss > self.args.autotrash_kl_blur_ratio * recon_loss:
-            print("warning: weighted KL is large versus reconstruction; latent smoothing may blur reconstructions")
-        if self.prev_recon_loss is not None and recon_loss < self.prev_recon_loss * self.args.autotrash_recon_collapse_ratio:
-            print("warning: reconstruction loss collapsed quickly; skip paths may be bypassing the bottleneck")
-        self.prev_recon_loss = recon_loss
-        self.prev_source_loss = source_loss
-        self.prev_target_loss = target_loss
-
     def _progress_line(self, epoch, batch_idx, n_batches, train_start, epoch_start, losses):
         elapsed = time.time() - train_start
         completed_batches = (epoch - 1) * n_batches + batch_idx
@@ -528,14 +522,6 @@ class AutoTrashCnnDaeKl(BaseModel):
             f"remaining training estimate: {_format_seconds(avg_batch_seconds * denom * remaining_epochs)}"
         )
 
-        self._warn_if_needed(
-            recon_loss=means["recon"],
-            source_loss=means["source"],
-            target_loss=means["target"],
-            kl_loss=means["kl"],
-            lambda_kl=lambda_kl,
-        )
-
         with open(self.log_path, "a") as log:
             np.savetxt(log, ["{0},{1},{2},{3},{4},{5},{6},{7},{8},{9}".format(
                 means["loss"],
@@ -564,7 +550,7 @@ class AutoTrashCnnDaeKl(BaseModel):
             "optimizer_state_dict": self.optimizer.state_dict(),
             "loss": self.loss,
         }, self.checkpoint_path)
-        if epoch == self.args.epochs and self.args.autotrash_clean_threshold_calibration:
+        if epoch == self.args.epochs:
             self._run_final_threshold_calibration()
 
     def _validate(self):
@@ -582,14 +568,21 @@ class AutoTrashCnnDaeKl(BaseModel):
     def _run_final_threshold_calibration(self):
         """
         Calibrate the decision threshold once after training completes.
-        Uses only held-out validation clips from the source domain.
+        Uses clip-level scores (one mean score per file) from held-out
+        validation source clips only.
+
+        Clip-level calibration is essential: test() scores each clip as
+        the mean of its patch errors. Calibrating on patch-level scores
+        produces a threshold far too high for clip-level scores because
+        patch variance >> clip variance (Central Limit Theorem).
 
         Source-only rationale:
         - 990 source normals give a stable score distribution
         - Target scores are systematically offset from source scores
         - Mixing them biases the threshold upward, causing target recall collapse
         """
-        scores = []
+        score_sum = {}
+        score_count = {}
         with torch.no_grad():
             self.model.eval()
             for batch in self.valid_loader:
@@ -600,34 +593,41 @@ class AutoTrashCnnDaeKl(BaseModel):
                 for basename, score in zip(basenames, patch_errors):
                     if "target" in basename:
                         continue
-                    scores.append(float(score))
+                    score_sum[basename] = score_sum.get(basename, 0.0) + float(score)
+                    score_count[basename] = score_count.get(basename, 0) + 1
 
-        if len(scores) == 0:
+        if len(score_sum) == 0:
             print("warning: no source clips found in valid_loader; falling back to all validation clips")
             with torch.no_grad():
                 self.model.eval()
                 for batch in self.valid_loader:
                     data = batch[0].to(self.device).float()
+                    basenames = batch[3]
                     recon_batch, _, _, _ = self.model(data)
                     patch_errors = self._sample_scores(recon_batch, data).detach().cpu().numpy()
-                    scores.extend([float(s) for s in patch_errors])
+                    for basename, score in zip(basenames, patch_errors):
+                        score_sum[basename] = score_sum.get(basename, 0.0) + float(score)
+                        score_count[basename] = score_count.get(basename, 0) + 1
 
-        scores_array = np.array(scores)
+        clip_scores = np.array([
+            score_sum[name] / score_count[name]
+            for name in sorted(score_sum)
+        ])
+
         print(
-            f"threshold calibration -> {len(scores)} source patches | "
-            f"mean={np.mean(scores_array):.6f} | std={np.std(scores_array):.6f} | "
-            f"min={np.min(scores_array):.6f} | max={np.max(scores_array):.6f}"
+            f"threshold calibration -> {len(clip_scores)} source clips (clip-level) | "
+            f"mean={np.mean(clip_scores):.6f} | std={np.std(clip_scores):.6f} | "
+            f"min={np.min(clip_scores):.6f} | max={np.max(clip_scores):.6f}"
         )
-        self.fit_anomaly_score_distribution(y_pred=scores_array)
+        self.fit_anomaly_score_distribution(y_pred=clip_scores)
 
         fitted_threshold = self.calc_decision_threshold()
-        p99 = float(np.percentile(scores_array, 99))
-        print(f"fitted threshold -> {fitted_threshold:.6f} | p99 of calibration scores -> {p99:.6f}")
+        p99 = float(np.percentile(clip_scores, 99))
+        print(f"fitted threshold -> {fitted_threshold:.6f} | p99 of clip scores -> {p99:.6f}")
         if fitted_threshold > p99 * 2.0:
             print(
                 f"WARNING: fitted threshold ({fitted_threshold:.6f}) far exceeds 2x p99 "
-                f"({p99 * 2.0:.6f}). Gamma fit may have failed on this seed. "
-                f"Decision file results will be unreliable for this run."
+                f"({p99 * 2.0:.6f}). Gamma fit may have failed on this seed."
             )
 
     def load_state_dict(self, checkpoint):
@@ -642,8 +642,7 @@ class AutoTrashCnnDaeKl(BaseModel):
             raise FileNotFoundError(f"model not found -> {self.model_path}")
         self.model.load_state_dict(torch.load(self.model_path, map_location=self.device))
         self.model.eval()
-        if self.args.autotrash_clean_threshold_calibration:
-            self._run_final_threshold_calibration()
+        self._run_final_threshold_calibration()
         decision_threshold = self.calc_decision_threshold()
         print(f"decision threshold -> {decision_threshold:.6f}")
 
@@ -744,8 +743,6 @@ class AutoTrashCnnDaeKl(BaseModel):
                 csv_lines.append(self.result_column_dict["source_target"])
             row = [auc_s, auc_t, p_auc, p_auc_s, p_auc_t, prec_s, prec_t, recall_s, recall_t, f1_s, f1_t]
             csv_lines.append([section_name.split("_", 1)[1]] + row)
-            if auc_t > auc_s and auc_s < self.args.autotrash_source_auc_warn_floor:
-                print("warning: target AUC exceeds source AUC while source AUC is low; possible over-alignment")
             return row
 
         if len(csv_lines) == 0:

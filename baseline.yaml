@@ -40,12 +40,11 @@
 --autotrash_use_denoising: True
 --autotrash_use_augmentation: True
 --autotrash_use_balanced_recon: True
---autotrash_use_kl: True
+--autotrash_use_kl: False
 --autotrash_kl_start_epoch: 6
 --autotrash_kl_max_weight: 0.001
 --autotrash_cache_directory: ""
 --autotrash_rebuild_cache: False
---autotrash_clean_threshold_calibration: True
 --autotrash_aug_gaussian_std: 0.03
 --autotrash_aug_gain_min: 0.8
 --autotrash_aug_gain_max: 1.2
@@ -53,10 +52,10 @@
 --autotrash_aug_time_mask_prob: 0.5
 --autotrash_aug_freq_mask_width: 8
 --autotrash_aug_freq_mask_prob: 0.5
---autotrash_use_supplemental_clean: True
+--autotrash_use_supplemental_clean: False
 --autotrash_supplemental_clean_glob: "*machine*.wav"
---autotrash_supplemental_domain: target
---autotrash_use_supplemental_noise: True
+--autotrash_supplemental_domain: source
+--autotrash_use_supplemental_noise: False
 --autotrash_supplemental_noise_glob: "*noise*.wav"
 --autotrash_noise_mix_prob: 0.3
 --autotrash_noise_snr_min: 10.0
@@ -64,7 +63,3 @@
 --autotrash_grad_clip: 5.0
 --autotrash_show_progress: True
 --autotrash_eta_update_interval: 10
---autotrash_source_bias_warn_ratio: 0.7
---autotrash_kl_blur_ratio: 0.1
---autotrash_recon_collapse_ratio: 0.5
---autotrash_source_auc_warn_floor: 0.6
